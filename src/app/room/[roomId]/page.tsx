@@ -30,6 +30,11 @@ const statusText: Record<ConnectionStatus, string> = {
 const getStunServer = (): string =>
   process.env.NEXT_PUBLIC_STUN_SERVER ?? "stun:stun.l.google.com:19302";
 
+const getSignalingServerUrl = (): string | undefined => {
+  const url = process.env.NEXT_PUBLIC_SIGNALING_SERVER_URL?.trim();
+  return url ? url : undefined;
+};
+
 const getIceServers = (): RTCIceServer[] => {
   const servers: RTCIceServer[] = [{ urls: [getStunServer()] }];
 
@@ -380,9 +385,14 @@ export default function RoomPage() {
           localVideoRef.current.srcObject = localStream;
         }
 
-        const socket = io({
-          transports: ["websocket"],
+        const signalingServerUrl = getSignalingServerUrl();
+        const socket = io(signalingServerUrl, {
+          transports: ["websocket", "polling"],
+          upgrade: true,
           reconnection: true,
+          reconnectionAttempts: 10,
+          timeout: 10000,
+          withCredentials: false,
         });
 
         socketRef.current = socket;
@@ -397,6 +407,12 @@ export default function RoomPage() {
         socket.on("disconnect", () => {
           socketIdRef.current = "";
           setSelfSocketId("");
+        });
+
+        socket.on("connect_error", () => {
+          setError(
+            "Unable to connect to signaling server. If deployed on Vercel, host signaling server separately and set NEXT_PUBLIC_SIGNALING_SERVER_URL.",
+          );
         });
 
         socket.on("room-users", async ({ users }) => {

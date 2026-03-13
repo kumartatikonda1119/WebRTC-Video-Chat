@@ -55,6 +55,7 @@ Copy `.env.example` to `.env.local` (or `.env`) and update values as needed.
 - `PORT`: server port (default `3000`)
 - `NEXT_PUBLIC_STUN_SERVER`: STUN server URL exposed to browser
 - `SOCKET_IO_CORS_ORIGIN`: CORS origin for signaling server
+- `NEXT_PUBLIC_SIGNALING_SERVER_URL`: external signaling URL when socket server is not co-hosted
 - `NEXT_PUBLIC_TURN_URL`: optional TURN URL for cross-network reliability
 - `NEXT_PUBLIC_TURN_USERNAME`: optional TURN username
 - `NEXT_PUBLIC_TURN_CREDENTIAL`: optional TURN credential
@@ -128,6 +129,8 @@ Server -> Client:
 ## Production Notes
 
 - Current setup uses public STUN server by default.
+- Vercel does not host long-lived custom Socket.IO servers from `server.ts`.
+- If frontend is on Vercel, deploy signaling server separately (Render/Railway/Fly.io/VM) and set `NEXT_PUBLIC_SIGNALING_SERVER_URL`.
 - For broader NAT compatibility, configure TURN env variables in `.env`.
 - Mesh topology is appropriate for small rooms (up to 4 users).
 - For larger rooms, move to SFU architecture.

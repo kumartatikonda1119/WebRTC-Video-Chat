@@ -30,6 +30,24 @@ const statusText: Record<ConnectionStatus, string> = {
 const getStunServer = (): string =>
   process.env.NEXT_PUBLIC_STUN_SERVER ?? "stun:stun.l.google.com:19302";
 
+const getIceServers = (): RTCIceServer[] => {
+  const servers: RTCIceServer[] = [{ urls: [getStunServer()] }];
+
+  const turnUrl = process.env.NEXT_PUBLIC_TURN_URL;
+  const turnUsername = process.env.NEXT_PUBLIC_TURN_USERNAME;
+  const turnCredential = process.env.NEXT_PUBLIC_TURN_CREDENTIAL;
+
+  if (turnUrl && turnUsername && turnCredential) {
+    servers.push({
+      urls: [turnUrl],
+      username: turnUsername,
+      credential: turnCredential,
+    });
+  }
+
+  return servers;
+};
+
 const toRtcSdp = (sdp: SignalSdp): RTCSessionDescriptionInit => ({
   type: sdp.type,
   sdp: sdp.sdp,
@@ -105,6 +123,9 @@ export default function RoomPage() {
     ClientToServerEvents
   > | null>(null);
   const peerConnectionsRef = useRef<Map<string, RTCPeerConnection>>(new Map());
+  const pendingIceCandidatesRef = useRef<Map<string, RTCIceCandidateInit[]>>(
+    new Map(),
+  );
   const socketIdRef = useRef("");
 
   const [remoteStreams, setRemoteStreams] = useState<
@@ -115,9 +136,17 @@ export default function RoomPage() {
   const [isMicMuted, setIsMicMuted] = useState(false);
   const [isCameraOff, setIsCameraOff] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [infoMessage, setInfoMessage] = useState<string | null>(null);
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<ChatMessagePayload[]>([]);
   const [selfSocketId, setSelfSocketId] = useState("");
+  const inviteLink = useMemo(() => {
+    if (typeof window === "undefined" || !roomId) {
+      return "";
+    }
+
+    return `${window.location.origin}/room/${roomId}`;
+  }, [roomId]);
 
   const connectionStatus: ConnectionStatus =
     connectedPeerIds.length > 0
@@ -135,6 +164,8 @@ export default function RoomPage() {
       peerConnection.close();
       peerConnectionsRef.current.delete(peerId);
     }
+
+    pendingIceCandidatesRef.current.delete(peerId);
 
     setPeerIds((prev) => prev.filter((id) => id !== peerId));
     setConnectedPeerIds((prev) => prev.filter((id) => id !== peerId));
@@ -161,7 +192,7 @@ export default function RoomPage() {
       }
 
       const peerConnection = new RTCPeerConnection({
-        iceServers: [{ urls: [getStunServer()] }],
+        iceServers: getIceServers(),
       });
 
       const localStream = localStreamRef.current;
@@ -220,6 +251,42 @@ export default function RoomPage() {
     [removePeer, roomId],
   );
 
+  const flushPendingIceCandidates = useCallback(async (peerId: string) => {
+    const peerConnection = peerConnectionsRef.current.get(peerId);
+    if (!peerConnection || !peerConnection.remoteDescription) {
+      return;
+    }
+
+    const queue = pendingIceCandidatesRef.current.get(peerId);
+    if (!queue || queue.length === 0) {
+      return;
+    }
+
+    for (const queuedCandidate of queue) {
+      await peerConnection
+        .addIceCandidate(queuedCandidate)
+        .catch(() => undefined);
+    }
+
+    pendingIceCandidatesRef.current.delete(peerId);
+  }, []);
+
+  const queueOrAddIceCandidate = useCallback(
+    async (peerId: string, candidate: RTCIceCandidateInit) => {
+      const peerConnection = await ensurePeerConnection(peerId);
+
+      if (peerConnection.remoteDescription) {
+        await peerConnection.addIceCandidate(candidate).catch(() => undefined);
+        return;
+      }
+
+      const currentQueue = pendingIceCandidatesRef.current.get(peerId) ?? [];
+      currentQueue.push(candidate);
+      pendingIceCandidatesRef.current.set(peerId, currentQueue);
+    },
+    [ensurePeerConnection],
+  );
+
   const maybeCreateOffer = useCallback(
     async (peerId: string) => {
       if (!socketRef.current || !roomId || !shouldCreateOffer(peerId)) {
@@ -262,6 +329,7 @@ export default function RoomPage() {
         peerConnection.close();
       });
       peerConnectionsRef.current.clear();
+      pendingIceCandidatesRef.current.clear();
 
       if (localStreamRef.current) {
         localStreamRef.current.getTracks().forEach((track) => track.stop());
@@ -353,6 +421,7 @@ export default function RoomPage() {
           }
 
           await peerConnection.setRemoteDescription(toRtcSdp(sdp));
+          await flushPendingIceCandidates(fromSocketId);
           const answer = await peerConnection.createAnswer();
           await peerConnection.setLocalDescription(answer);
 
@@ -366,13 +435,11 @@ export default function RoomPage() {
         socket.on("answer", async ({ fromSocketId, sdp }) => {
           const peerConnection = await ensurePeerConnection(fromSocketId);
           await peerConnection.setRemoteDescription(toRtcSdp(sdp));
+          await flushPendingIceCandidates(fromSocketId);
         });
 
         socket.on("ice-candidate", async ({ fromSocketId, candidate }) => {
-          const peerConnection = await ensurePeerConnection(fromSocketId);
-          await peerConnection
-            .addIceCandidate(new RTCIceCandidate(toRtcCandidate(candidate)))
-            .catch(() => undefined);
+          await queueOrAddIceCandidate(fromSocketId, toRtcCandidate(candidate));
         });
 
         socket.on("user-left", ({ socketId }) => {
@@ -405,7 +472,34 @@ export default function RoomPage() {
       isMounted = false;
       hangup(false);
     };
-  }, [ensurePeerConnection, hangup, maybeCreateOffer, removePeer, roomId]);
+  }, [
+    ensurePeerConnection,
+    flushPendingIceCandidates,
+    hangup,
+    maybeCreateOffer,
+    queueOrAddIceCandidate,
+    removePeer,
+    roomId,
+  ]);
+
+  const copyInviteLink = useCallback(async () => {
+    if (!inviteLink) {
+      return;
+    }
+
+    try {
+      await navigator.clipboard.writeText(inviteLink);
+      setInfoMessage(
+        "Invite link copied. Share it with others to join this room.",
+      );
+      setTimeout(() => setInfoMessage(null), 2500);
+    } catch {
+      setInfoMessage(
+        "Unable to copy automatically. Copy the room link manually.",
+      );
+      setTimeout(() => setInfoMessage(null), 2500);
+    }
+  }, [inviteLink]);
 
   const toggleMic = useCallback(() => {
     const stream = localStreamRef.current;
@@ -504,6 +598,33 @@ export default function RoomPage() {
               {error}
             </p>
           )}
+
+          {infoMessage && (
+            <p className="mb-4 rounded-xl border border-cyan-400/40 bg-cyan-950/40 px-4 py-3 text-sm text-cyan-200">
+              {infoMessage}
+            </p>
+          )}
+
+          <div className="mb-4 rounded-xl border border-slate-700 bg-slate-950/70 p-3">
+            <p className="mb-2 text-xs text-slate-400">
+              Invite people using this room link
+            </p>
+            <div className="flex flex-col gap-2 md:flex-row">
+              <input
+                value={inviteLink}
+                readOnly
+                className="w-full rounded-lg border border-slate-700 bg-slate-900 px-3 py-2 text-xs text-slate-200"
+              />
+              <button
+                type="button"
+                data-test-id="copy-invite-button"
+                onClick={copyInviteLink}
+                className="rounded-lg border border-cyan-500 bg-cyan-500/15 px-4 py-2 text-sm transition hover:bg-cyan-500/30"
+              >
+                Copy Invite Link
+              </button>
+            </div>
+          </div>
 
           <div
             data-test-id="remote-video-container"
